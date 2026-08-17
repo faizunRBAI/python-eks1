@@ -12,62 +12,81 @@ jobs:
       AWS_REGION: us-east-1
       TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
     steps:
-    - uses: actions/checkout@v4
-    - uses: azure/setup-kubectl@v4
-      with:
-        version: v1.33.0
-    - uses: hashicorp/setup-terraform@v3
-      with:
-        terraform_wrapper: false
-    - uses: azure/setup-helm@v4
-      with:
-        version: v3.16.4
-    - name: Read the VPC id from state
-      run: "terraform init -input=false -reconfigure \\\n  -backend-config=\"bucket=${{\
-        \ secrets.TF_STATE_BUCKET }}\" \\\n  -backend-config=\"key=${{ secrets.PROJECT_NAME\
-        \ }}/terraform.tfstate\" \\\n  -backend-config=\"region=${AWS_REGION}\"\n\
-        echo \"VPC_ID=$(terraform output -raw vpc_id 2>/dev/null || true)\" >> \"\
-        $GITHUB_ENV\"\n"
-      working-directory: infra
-    - name: Configure cluster access
-      run: "NAMESPACE=\"${{ secrets.PROJECT_NAME }}\"\nif ! aws eks update-kubeconfig\
-        \ --name \"${NAMESPACE}-eks\" --region \"$AWS_REGION\" 2>/dev/null; then\n\
-        \  echo \"Cluster is already gone \u2014 skipping Kubernetes cleanup.\"\n\
-        \  exit 0\nfi\necho \"CLUSTER_ACCESSIBLE=true\" >> \"$GITHUB_ENV\"\n"
-    - name: Uninstall ingress-nginx (removes its NLB)
-      run: 'if [ "${CLUSTER_ACCESSIBLE:-}" != "true" ]; then exit 0; fi
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.33.0
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+      - name: Read the VPC id from state
+        run: "terraform init -input=false -reconfigure \\ -backend-config=\"bucket=${{ secrets.TF_STATE_BUCKET }}\" \\ -backend-config=\"key=${{ secrets.PROJECT_NAME }}/terraform.tfstate\" \\ -backend-config=\"region=${AWS_REGION}\" echo \"VPC_ID=$(terraform output -raw vpc_id 2>/dev/null || true)\" >> \" $GITHUB_ENV\" "
+        working-directory: infra
+      - name: Configure cluster access
+        run: "NAMESPACE=\"${{ secrets.PROJECT_NAME }}\" if ! aws eks update-kubeconfig \\ --name \"${NAMESPACE}-eks\" --region \"$AWS_REGION\" 2>/dev/null; then echo \"Cluster is already gone — skipping Kubernetes cleanup.\" exit 0 fi echo \"CLUSTER_ACCESSIBLE=true\" >> \"$GITHUB_ENV\" "
+      - name: Uninstall ingress-nginx (removes its NLB)
+        run: 'if [ "${CLUSTER_ACCESSIBLE:-}" != "true" ]; then exit 0; fi
 
-        helm uninstall ingress-nginx --namespace ingress-nginx --ignore-not-found
-        --wait --timeout 5m || true
+          helm uninstall ingress-nginx --namespace ingress-nginx --ignore-not-found --wait --timeout 5m || true
 
-        '
-    - name: Uninstall cert-manager
-      run: 'if [ "${CLUSTER_ACCESSIBLE:-}" != "true" ]; then exit 0; fi
+          '
+      - name: Uninstall cert-manager
+        run: 'if [ "${CLUSTER_ACCESSIBLE:-}" != "true" ]; then exit 0; fi
 
-        helm uninstall cert-manager --namespace cert-manager --ignore-not-found --wait
-        --timeout 5m || true
+          helm uninstall cert-manager --namespace cert-manager --ignore-not-found --wait --timeout 5m || true
 
-        '
-    - name: Delete the app namespace and its resources
-      run: 'if [ "${CLUSTER_ACCESSIBLE:-}" != "true" ]; then exit 0; fi
+          '
+      - name: Delete the app namespace and its resources
+        run: 'if [ "${CLUSTER_ACCESSIBLE:-}" != "true" ]; then exit 0; fi
 
-        NAMESPACE="${{ secrets.PROJECT_NAME }}"
+          NAMESPACE="${{ secrets.PROJECT_NAME }}"
 
-        kubectl delete namespace "$NAMESPACE" --ignore-not-found --timeout=5m || true
+          kubectl delete namespace "$NAMESPACE" --ignore-not-found --timeout=5m || true
 
-        '
-    - name: Wait for LBs to be released
-      run: "if [ -z \"${VPC_ID:-}\" ]; then\n  sleep 60\n  exit 0\nfi\nfor _ in $(seq\
-        \ 1 40); do\n  V2=\"$(aws elbv2 describe-load-balancers \\\n         --query\
-        \ \"length(LoadBalancers[?VpcId=='${VPC_ID}'])\" --output text 2>/dev/null\
-        \ || echo 0)\"\n  V1=\"$(aws elb describe-load-balancers \\\n         --query\
-        \ \"length(LoadBalancerDescriptions[?VPCId=='${VPC_ID}'])\" --output text\
-        \ 2>/dev/null || echo 0)\"\n  echo \"  load balancers remaining: elbv2=${V2}\
-        \ classic=${V1}\"\n  if [ \"$V2\" = \"0\" ] && [ \"$V1\" = \"0\" ]; then\n\
-        \    sleep 30\n    exit 0\n  fi\n  sleep 15\ndone\necho \"::warning::Load\
-        \ balancers still present after 10 minutes; attempting the destroy anyway.\"\
-        \n"
-    - name: Terraform destroy
-      run: "set -uo pipefail\nif terraform destroy -input=false -auto-approve; then\n\
-        \  exit 0\nfi\nsleep 90\nterraform destroy -input=false -auto-approve\n"
-      working-directory: infra
+          '
+      - name: Wait for LBs to be released
+        run: "if [ -z \"${VPC_ID:-}\" ]; then sleep 60 exit 0 fi for _ in $(seq 1 40); do V2=\"$(aws elbv2 describe-load-balancers \\ --query \"length(LoadBalancers[?VpcId=='${VPC_ID}'])\" --output text 2>/dev/null || echo 0)\" V1=\"$(aws elb describe-load-balancers \\ --query \"length(LoadBalancerDescriptions[?VPCId=='${VPC_ID}'])\" --output text 2>/dev/null || echo 0)\" echo \"  load balancers remaining: elbv2=${V2} classic=${V1}\" if [ \"$V2\" = \"0\" ] && [ \"$V1\" = \"0\" ]; then sleep 30 exit 0 fi sleep 15 done echo \"::warning::Load balancers still present after 10 minutes; attempting the destroy anyway.\" "
+      - name: Drain orphaned ENIs from the VPC
+        run: |
+          # After the NLB ELBv2 is deleted, AWS asynchronously releases the
+          # network interfaces it created in the VPC subnets. Those ENIs block
+          # subnet and IGW deletion in terraform destroy. Poll until they are
+          # gone; force-delete any that have been available/detached for too long.
+          if [ -z "${VPC_ID:-}" ]; then
+            echo "No VPC_ID — skipping ENI cleanup."
+            exit 0
+          fi
+          echo "Waiting for orphaned ENIs in VPC ${VPC_ID} to clear..."
+          for i in $(seq 1 30); do
+            ENIS="$(aws ec2 describe-network-interfaces \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query 'NetworkInterfaces[?Status!=`in-use`].NetworkInterfaceId' \
+              --output text 2>/dev/null || true)"
+            if [ -z "$ENIS" ]; then
+              echo "  No orphaned ENIs found — VPC is clear."
+              exit 0
+            fi
+            echo "  Attempt ${i}: orphaned ENIs: ${ENIS}"
+            for ENI_ID in $ENIS; do
+              # Detach first if still attached (status=detaching), then delete.
+              ATTACHMENT_ID="$(aws ec2 describe-network-interfaces \
+                --network-interface-ids "$ENI_ID" \
+                --query 'NetworkInterfaces[0].Attachment.AttachmentId' \
+                --output text 2>/dev/null || true)"
+              if [ -n "$ATTACHMENT_ID" ] && [ "$ATTACHMENT_ID" != "None" ]; then
+                aws ec2 detach-network-interface \
+                  --attachment-id "$ATTACHMENT_ID" --force 2>/dev/null || true
+                sleep 5
+              fi
+              aws ec2 delete-network-interface \
+                --network-interface-id "$ENI_ID" 2>/dev/null || true
+            done
+            sleep 10
+          done
+          echo "::warning::Some ENIs may still remain after cleanup attempts; proceeding with terraform destroy."
+      - name: Terraform destroy
+        run: "set -uo pipefail if terraform destroy -input=false -auto-approve; then exit 0 fi sleep 90 terraform destroy -input=false -auto-approve "
+        working-directory: infra
