@@ -19,13 +19,9 @@ jobs:
     - uses: hashicorp/setup-terraform@v3
       with:
         terraform_wrapper: false
-    - name: Install Helm
-      run: 'curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-        | bash
-
-        helm version
-
-        '
+    - uses: azure/setup-helm@v4
+      with:
+        version: v3.16.4
     - name: Read the VPC id from state
       run: "terraform init -input=false -reconfigure \\\n  -backend-config=\"bucket=${{\
         \ secrets.TF_STATE_BUCKET }}\" \\\n  -backend-config=\"key=${{ secrets.PROJECT_NAME\

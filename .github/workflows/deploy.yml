@@ -281,13 +281,9 @@ jobs:
     - uses: azure/setup-kubectl@v4
       with:
         version: v1.33.0
-    - name: Install Helm
-      run: 'curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-        | bash
-
-        helm version
-
-        '
+    - uses: azure/setup-helm@v4
+      with:
+        version: v3.16.4
     - name: Read the database connection string
       run: "terraform init -input=false -reconfigure \\\n  -backend-config=\"bucket=${{\
         \ secrets.TF_STATE_BUCKET }}\" \\\n  -backend-config=\"key=${{ secrets.PROJECT_NAME\
@@ -313,9 +309,8 @@ jobs:
         \ 4.11.3 \\\n  --values k8s/ingress-nginx-values.yaml \\\n  --wait \\\n  --timeout\
         \ 5m\n"
     - name: Apply ClusterIssuer (Let's Encrypt)
-      run: "# Wait until cert-manager webhook is ready before applying CRDs\nkubectl\
-        \ rollout status deployment/cert-manager-webhook \\\n  --namespace cert-manager\
-        \ --timeout=3m\nkubectl apply -f k8s/clusterissuer.yaml\n"
+      run: "kubectl rollout status deployment/cert-manager-webhook \\\n  --namespace\
+        \ cert-manager --timeout=3m\nkubectl apply -f k8s/clusterissuer.yaml\n"
     - name: Install the metrics server
       run: "kubectl apply -f \\\n  https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml\n"
     - name: Bootstrap namespace, secret and service account

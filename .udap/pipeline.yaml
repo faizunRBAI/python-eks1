@@ -343,11 +343,9 @@ stages:
       - uses: azure/setup-kubectl@v4
         with:
           version: v1.33.0
-
-      - name: Install Helm
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-          helm version
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
 
       - name: Read the database connection string
         working-directory: infra
@@ -396,7 +394,6 @@ stages:
 
       - name: Apply ClusterIssuer (Let's Encrypt)
         run: |
-          # Wait until cert-manager webhook is ready before applying CRDs
           kubectl rollout status deployment/cert-manager-webhook \
             --namespace cert-manager --timeout=3m
           kubectl apply -f k8s/clusterissuer.yaml
@@ -546,8 +543,6 @@ stages:
           echo "============================================================"
 
       - name: Health check via NLB (pre-DNS)
-        # Verifies the app responds correctly through the ingress controller
-        # even before the CNAME propagates, by sending the Host header manually.
         run: |
           set -euo pipefail
           for i in $(seq 1 40); do
@@ -620,10 +615,9 @@ destroy:
     - uses: hashicorp/setup-terraform@v3
       with:
         terraform_wrapper: false
-    - name: Install Helm
-      run: |
-        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-        helm version
+    - uses: azure/setup-helm@v4
+      with:
+        version: v3.16.4
     - name: Read the VPC id from state
       working-directory: infra
       run: |
