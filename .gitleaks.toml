@@ -1,0 +1,11 @@
+title = "UDAP Python on EKS blueprint"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Paths whose high-entropy strings are not credentials"
+paths = [
+  # Hand-drawn SVG diagram — no secrets, but plenty of long path data.
+  '''\.udap/docs/screenshot\.svg''',
+]

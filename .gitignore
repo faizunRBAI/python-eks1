@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.log
+.env
+.env.*
+
+# Terraform working files — state lives in the platform-managed S3 backend.
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+
+# Written per project when the blueprint is instantiated.
+infra/udap.auto.tfvars
+
+# Scanner and SBOM output.
+*.sarif
+sbom-*.json
+licenses.csv

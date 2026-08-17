@@ -1,0 +1,13 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+  namespace: '%%NAMESPACE%%'
+  labels:
+    app.kubernetes.io/name: api
+spec:
+  # Node drains during an upgrade must leave at least one pod serving.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api

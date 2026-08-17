@@ -1,0 +1,17 @@
+# udap:meta cloud=aws region=us-east-1 target=eks
+
+users: API Clients { udap-type: generic.user }
+nlb: Network Load Balancer { udap-type: aws.alb }
+registry: Image Registry (ECR) { udap-type: aws.ecr }
+audit: Audit + Flow Logs { udap-type: aws.cloudwatch }
+vpc: VPC across 2 Availability Zones {
+  api: Python API Pods (EKS) { udap-type: aws.eks }
+  db: Postgres (RDS) { shape: cylinder; udap-type: aws.rds }
+}
+
+users -> nlb: HTTPS
+nlb -> vpc.api: port 80
+vpc.api -> vpc.db: SQL 5432
+registry -> vpc.api: image pull
+vpc.api -> audit: logs
+vpc.db -> audit: metrics

@@ -1,0 +1,76 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+  namespace: '%%NAMESPACE%%'
+  labels:
+    app.kubernetes.io/name: db-migrate
+    app.kubernetes.io/component: migration
+spec:
+  # One attempt. A failed migration is investigated, never retried blindly —
+  # and a retry loop would hide the failure behind a wait timeout.
+  backoffLimit: 0
+  # Keep the finished Job around long enough to read its logs after a deploy.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: db-migrate
+    spec:
+      restartPolicy: Never
+      serviceAccountName: api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          # The application image — the migration tool and the SQL files ship
+          # inside it, so the schema can never drift from the code that expects it.
+          image: '%%IMAGE%%'
+          imagePullPolicy: IfNotPresent
+          # The blueprint owns WHEN migrations run, not HOW. bin/migrate is the
+          # seam: point it at Prisma, Knex, Drizzle, Flyway or psql and neither
+          # this manifest nor the pipeline changes. Invoked through `sh` rather
+          # than as an executable so a checkout that lost the exec bit still
+          # works, and not through `npm` because the runtime image has no
+          # package manager by design.
+          command: ['sh', 'bin/migrate']
+          env:
+            - name: APP_ENV
+              value: production
+            # Keep these in step with the Deployment: the migration and the
+            # application must reach the database the same way.
+            - name: PGSSLMODE
+              value: verify-full
+            - name: PGSSLROOTCERT
+              value: /app/certs/rds-global-bundle.pem
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: app-database
+                  key: DATABASE_URL
+                  # Absent when the database module choice is `none`; the runner
+                  # then reports that there is nothing to migrate and exits 0.
+                  optional: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

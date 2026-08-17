@@ -1,0 +1,45 @@
+# The runtime stage copies the whole tree, so this file is what keeps the image
+# small and free of things it must not carry. Everything the application needs at
+# run time — app/, static/, db/migrations/, bin/ — is deliberately absent from
+# this list.
+
+# Version control and CI
+.git
+.github
+.gitignore
+.gitattributes
+
+# Build inputs that are not runtime inputs
+Dockerfile
+.dockerignore
+requirements-dev.txt
+
+# Deploy-time assets: the cluster and the pipeline read these from the repo,
+# never from inside the image.
+.udap
+infra
+k8s
+modules
+
+# Tests and tooling config
+tests
+.pytest_cache
+.ruff_cache
+.trivyignore
+.gitleaks.toml
+
+# Local artefacts
+__pycache__
+*.pyc
+.venv
+venv
+
+# Docs
+*.md
+
+# Secrets and scanner output must never be baked in
+.env
+.env.*
+sbom-*.json
+licenses.csv
+*.sarif

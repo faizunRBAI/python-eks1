@@ -1,0 +1,8 @@
+# Everything in this repository is consumed on Linux — CI runners, container
+# builds and the cluster. Normalise to LF so a checkout on Windows cannot ship
+# CRLF into a shell script or a Dockerfile.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary

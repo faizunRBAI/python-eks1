@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: '%%NAMESPACE%%'
+  labels:
+    app.kubernetes.io/name: api
+spec:
+  # 2 is substituted once, when the project is created from
+  # this blueprint. %%IMAGE%% and %%NAMESPACE%% are substituted by the configure
+  # stage on every deploy.
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never drop below the current replica count while rolling forward.
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api
+    spec:
+      serviceAccountName: api
+      # Give the drain in server.js room to finish before SIGKILL.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        # Spread replicas across availability zones so losing one zone cannot
+        # take the whole service with it.
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: api
+      containers:
+        - name: api
+          image: '%%IMAGE%%'
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: APP_ENV
+              value: production
+            - name: PORT
+              value: '8000'
+            - name: APP_VERSION
+              value: '%%IMAGE_TAG%%'
+            # libpq reads these directly, so certificate verification needs no
+            # application code deciding whether to trust the server.
+            # verify-full checks the RDS certificate against the CA bundle baked
+            # into the image AND that the hostname matches. 'disable' turns TLS
+            # off entirely and exists only for a Postgres that has none — never
+            # use it against RDS. Declared here rather than left implicit because
+            # a readiness probe failing on an SSL error is otherwise a puzzle
+            # with no visible knob.
+            - name: PGSSLMODE
+              value: verify-full
+            - name: PGSSLROOTCERT
+              value: /app/certs/rds-global-bundle.pem
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: app-database
+                  key: DATABASE_URL
+                  # Absent when the database module choice is `none`.
+                  optional: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              # Memory is capped because exceeding it is a bug; CPU is not,
+              # because throttling a healthy service is worse than bursting.
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

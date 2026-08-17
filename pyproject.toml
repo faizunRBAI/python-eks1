@@ -1,0 +1,38 @@
+[project]
+name = "udap-python-eks-api"
+version = "1.0.0"
+description = "Python API blueprint for Amazon EKS — FastAPI service with health and readiness endpoints, optional Postgres."
+requires-python = ">=3.12"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["db", "infra", "k8s", "static"]
+
+[tool.ruff.lint]
+# The coding-standards gate. Kept to rule sets that catch real problems rather
+# than everything Ruff can say, because a gate nobody can keep green gets
+# switched off.
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes: undefined names, unused imports
+    "I",    # import ordering
+    "B",    # bugbear: likely bugs
+    "UP",   # pyupgrade: outdated syntax
+    "S",    # bandit-derived security rules
+    "C4",   # comprehension correctness
+    "SIM",  # simplifiable code
+    "RET",  # inconsistent returns
+]
+ignore = [
+    # Asserts are the point of a test file.
+    "S101",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests bind to localhost and assert freely.
+"tests/*" = ["S101", "S104"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

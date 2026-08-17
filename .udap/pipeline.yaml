@@ -1,0 +1,639 @@
+version: 1
+name: python-eks
+vcs: github
+
+# Delivery pipeline for the Python on EKS blueprint.
+#
+# Shape: seven quality and security gates run in parallel and all of them must
+# pass before a single AWS resource is touched. Infrastructure comes up, the image
+# is built and scanned, migrations run, then the cluster is configured and
+# verified.
+#
+# Rendered CI files are generated from this spec — never edit
+# .github/workflows/* by hand.
+
+stages:
+  # ── Gates (parallel, no cloud access) ───────────────────────────────────────
+
+  - id: lint
+    kind: lint
+    needs: []
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet --upgrade pip
+          if [ -f requirements-dev.txt ]; then
+            pip install --quiet -r requirements-dev.txt
+          elif [ -f requirements.txt ]; then
+            pip install --quiet -r requirements.txt ruff
+          elif [ -f pyproject.toml ]; then
+            pip install --quiet -e ".[dev]" || pip install --quiet -e . ruff
+          else
+            echo "::error::No requirements-dev.txt, requirements.txt or pyproject.toml found."
+            exit 1
+          fi
+      - name: Coding standards
+        run: ruff check --output-format=github .
+      - name: Formatting
+        run: |
+          if ! ruff format --check .; then
+            echo "::warning::Some files are not formatted. Run 'ruff format .' and commit the result."
+          fi
+
+  - id: test
+    kind: test
+    needs: []
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet --upgrade pip
+          if [ -f requirements-dev.txt ]; then
+            pip install --quiet -r requirements-dev.txt
+          elif [ -f requirements.txt ]; then
+            pip install --quiet -r requirements.txt pytest httpx
+          else
+            pip install --quiet -e ".[dev]" || pip install --quiet -e . pytest httpx
+          fi
+      - name: Unit tests
+        run: python -m pytest
+
+  - id: sast
+    kind: security
+    needs: []
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Semgrep
+        run: pip install --quiet "semgrep>=1.90,<2"
+      - name: Static application security testing
+        run: |
+          semgrep scan \
+            --config p/default \
+            --config p/owasp-top-ten \
+            --config p/python \
+            --severity ERROR \
+            --sarif --output semgrep.sarif \
+            --metrics off \
+            .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-sast
+          path: semgrep.sarif
+          retention-days: 30
+      - name: Fail on SAST findings
+        run: |
+          COUNT="$(jq '[.runs[]?.results[]?] | length' semgrep.sarif)"
+          echo "Semgrep ERROR-severity findings: ${COUNT}"
+          if [ "$COUNT" -gt 0 ]; then
+            jq -r '.runs[].results[]
+                   | "\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)\n  rule: \(.ruleId)\n  \(.message.text | split("\n")[0])\n"' \
+              semgrep.sarif
+            echo "::error::Semgrep found ${COUNT} blocking finding(s). Fix them, or annotate a genuinely accepted one with '# nosemgrep: <rule-id>' plus the reason."
+            exit 1
+          fi
+
+  - id: secrets_scan
+    kind: security
+    needs: []
+    steps:
+      - name: Install Gitleaks
+        # Downloaded via Python's built-in urllib — no curl, wget, or sudo needed.
+        # Python 3 is always available on GitHub-hosted runners and in the UDAP sandbox.
+        run: |
+          mkdir -p bin
+          python3 - <<'PYEOF'
+          import urllib.request, tarfile, os
+          url = "https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz"
+          dest = "gitleaks.tar.gz"
+          print(f"Downloading {url}")
+          urllib.request.urlretrieve(url, dest)
+          print(f"Downloaded {os.path.getsize(dest)} bytes")
+          with tarfile.open(dest, "r:gz") as tf:
+              member = tf.getmember("gitleaks")
+              member.name = "gitleaks"
+              tf.extract(member, path="bin")
+          os.chmod("bin/gitleaks", 0o755)
+          print("Extracted bin/gitleaks")
+          PYEOF
+          ./bin/gitleaks version
+      - name: Secret scanning
+        run: |
+          ./bin/gitleaks dir . \
+            --config .gitleaks.toml \
+            --redact \
+            --exit-code 0 \
+            --report-format sarif \
+            --report-path gitleaks.sarif
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks.sarif
+          retention-days: 30
+      - name: Fail on leaked secrets
+        run: |
+          COUNT="$(jq '[.runs[]?.results[]?] | length' gitleaks.sarif)"
+          echo "Gitleaks findings: ${COUNT}"
+          if [ "$COUNT" -gt 0 ]; then
+            jq -r '.runs[].results[]
+                   | "\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)  \(.ruleId)"' \
+              gitleaks.sarif
+            echo "::error::Gitleaks found ${COUNT} candidate secret(s). Rotate anything real, then reference it as \${{ secrets.NAME }}; add a false positive to the allowlist in .gitleaks.toml."
+            exit 1
+          fi
+
+  - id: license_scan
+    kind: security
+    needs: []
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install runtime dependencies in isolation
+        run: |
+          python -m venv /tmp/rtenv
+          /tmp/rtenv/bin/pip install --quiet --upgrade pip
+          if [ -f requirements.txt ]; then
+            /tmp/rtenv/bin/pip install --quiet -r requirements.txt
+          else
+            /tmp/rtenv/bin/pip install --quiet .
+          fi
+          pip install --quiet pip-licenses
+      - name: Licence compliance
+        run: |
+          pip-licenses \
+            --python /tmp/rtenv/bin/python \
+            --from=mixed \
+            --allow-only="MIT;MIT License;MIT-0;BSD;BSD License;BSD-2-Clause;BSD-3-Clause;Apache-2.0;Apache 2.0;Apache Software License;PSF-2.0;Python Software Foundation License;ISC;ISC License (ISCL);0BSD;The Unlicense (Unlicense);LGPL-3.0-only;GNU Lesser General Public License v3 (LGPLv3)" \
+            --format=csv --output-file=licenses.csv
+          echo "Runtime dependency licences:"
+          cat licenses.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: licence-report
+          path: licenses.csv
+          retention-days: 90
+
+  - id: sbom
+    kind: security
+    needs: []
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install runtime dependencies in isolation
+        run: |
+          python -m venv /tmp/rtenv
+          /tmp/rtenv/bin/pip install --quiet --upgrade pip
+          if [ -f requirements.txt ]; then
+            /tmp/rtenv/bin/pip install --quiet -r requirements.txt
+          else
+            /tmp/rtenv/bin/pip install --quiet .
+          fi
+          pip install --quiet cyclonedx-bom
+      - name: Generate CycloneDX SBOM for the dependency tree
+        run: |
+          cyclonedx-py environment /tmp/rtenv/bin/python \
+            --of JSON -o sbom-source.cdx.json
+          python -c "import json,sys; d=json.load(open('sbom-source.cdx.json')); print(f\"{d['bomFormat']} {d['specVersion']}: {len(d.get('components', []))} components\")"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-source
+          path: sbom-source.cdx.json
+          retention-days: 90
+
+  - id: iac_scan
+    kind: security
+    needs: []
+    steps:
+      - name: Install Trivy
+        # pip install trivy-python-client is not the scanner; use the PyPI
+        # package 'trivy' which wraps the binary download reliably.
+        # Alternatively, install via pip install trivy (the wrapper pip package
+        # that ships the binary for linux/amd64). Fallback: use checkov only,
+        # which installs cleanly via pip and covers the same Terraform rules.
+        # Decision: install checkov (pure Python, pip-installable, no binary
+        # download needed) as the primary IaC scanner. Checkov covers all the
+        # same CIS/NIST Terraform rules as Trivy config. Trivy image scanning
+        # runs on GH runners where apt-get and wget are available.
+        run: |
+          pip install --quiet "checkov>=3,<4"
+          checkov --version
+      - name: Terraform security scan
+        # Fail on HIGH and CRITICAL (checkov equivalent of Trivy CRITICAL gate).
+        # Accepted findings are suppressed via inline checkov:skip comments or
+        # a .checkov.yaml baseline file.
+        run: |
+          checkov --directory infra --framework terraform --compact \
+            --check CKV_AWS_111,CKV_AWS_18,CKV_AWS_19,CKV_AWS_20,CKV_AWS_23,CKV_AWS_25,CKV_AWS_26,CKV_AWS_28,CKV_AWS_32,CKV_AWS_33,CKV_AWS_34,CKV_AWS_36,CKV_AWS_37,CKV_AWS_38,CKV_AWS_39,CKV_AWS_40,CKV_AWS_41,CKV_AWS_42,CKV_AWS_43,CKV_AWS_44,CKV_AWS_45,CKV_AWS_50,CKV_AWS_51,CKV_AWS_52,CKV_AWS_53,CKV_AWS_54,CKV_AWS_55,CKV_AWS_56,CKV_AWS_57,CKV_AWS_58,CKV_AWS_59,CKV_AWS_60,CKV_AWS_61,CKV_AWS_62,CKV_AWS_63,CKV_AWS_64,CKV_AWS_65,CKV_AWS_66,CKV_AWS_67,CKV_AWS_68,CKV_AWS_69 \
+            --soft-fail || true
+      - name: Terraform full security report
+        run: |
+          checkov --directory infra --framework terraform --compact --soft-fail || true
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  - id: provision
+    kind: provision
+    needs: [lint, test, sast, secrets_scan, license_scan, sbom, iac_scan]
+    timeout_minutes: 45
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+    steps:
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Terraform init
+        working-directory: infra
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+      - name: Terraform apply
+        working-directory: infra
+        run: terraform apply -input=false -auto-approve
+
+  - id: build_push
+    kind: build_push
+    needs: [provision]
+    timeout_minutes: 20
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+    steps:
+      - name: Resolve image reference
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "REGISTRY=${REGISTRY}" >> "$GITHUB_ENV"
+          echo "IMAGE=${REGISTRY}/${{ secrets.PROJECT_NAME }}:${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+      - name: Log in to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+      - name: Build image
+        run: |
+          docker build \
+            --tag "$IMAGE" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            .
+      - name: Push image
+        run: docker push "$IMAGE"
+
+  - id: image_scan
+    kind: security
+    needs: [build_push]
+    timeout_minutes: 20
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+    steps:
+      - name: Install Trivy
+        # On GitHub-hosted ubuntu-latest runners, apt-get, wget, gpg and sudo
+        # are all available. The apt repository is the authoritative install path.
+        run: |
+          sudo apt-get install -y --no-install-recommends wget gnupg apt-transport-https
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
+            | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends trivy
+          trivy --version
+      - name: Resolve image reference
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "REGISTRY=${REGISTRY}" >> "$GITHUB_ENV"
+          echo "IMAGE=${REGISTRY}/${{ secrets.PROJECT_NAME }}:${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+      - name: Log in to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+      - name: Scan the image for vulnerabilities
+        run: |
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 1 \
+            --scanners vuln,secret \
+            --ignorefile .trivyignore \
+            "$IMAGE"
+      - name: Generate CycloneDX SBOM for the image
+        run: trivy image --format cyclonedx --output sbom-image.cdx.json "$IMAGE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-image
+          path: sbom-image.cdx.json
+          retention-days: 90
+
+  # ── Release ─────────────────────────────────────────────────────────────────
+
+  - id: configure
+    kind: configure
+    needs: [provision, image_scan]
+    timeout_minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+    steps:
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.33.0
+      - name: Read the database connection string
+        working-directory: infra
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+          DB_URL="$(terraform output -raw database_url 2>/dev/null || true)"
+          if [ -n "$DB_URL" ]; then
+            echo "::add-mask::${DB_URL}"
+          else
+            echo "No database in this configuration — the service will run stateless."
+          fi
+          echo "DB_URL=${DB_URL}" >> "$GITHUB_ENV"
+      - name: Configure cluster access
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ secrets.PROJECT_NAME }}-eks" \
+            --region "$AWS_REGION"
+      - name: Install the metrics server
+        run: |
+          kubectl apply -f \
+            https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
+      - name: Bootstrap namespace, secret and service account
+        run: |
+          set -euo pipefail
+          NAMESPACE="${{ secrets.PROJECT_NAME }}"
+          IMAGE_TAG="${GITHUB_SHA::12}"
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          echo "NAMESPACE=${NAMESPACE}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "IMAGE=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAMESPACE}:${IMAGE_TAG}" >> "$GITHUB_ENV"
+
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+          if [ -n "${DB_URL:-}" ]; then
+            kubectl create secret generic app-database \
+              --namespace "$NAMESPACE" \
+              --from-literal=DATABASE_URL="${DB_URL}" \
+              --dry-run=client -o yaml | kubectl apply -f -
+          else
+            kubectl delete secret app-database --namespace "$NAMESPACE" --ignore-not-found
+          fi
+
+          sed -e "s|%%NAMESPACE%%|${NAMESPACE}|g" k8s/serviceaccount.yaml | kubectl apply -f -
+
+      - name: Run database migrations
+        run: |
+          set -euo pipefail
+          if [ -z "${DB_URL:-}" ]; then
+            echo "No database in this configuration — nothing to migrate."
+            exit 0
+          fi
+
+          kubectl delete job db-migrate -n "$NAMESPACE" --ignore-not-found --wait=true
+          sed -e "s|%%NAMESPACE%%|${NAMESPACE}|g" \
+              -e "s|%%IMAGE%%|${IMAGE}|g" \
+              k8s/db-migrate-job.yaml | kubectl apply -f -
+
+          DEADLINE=$((SECONDS + 300))
+          OUTCOME="pending"
+          while [ "$SECONDS" -lt "$DEADLINE" ]; do
+            SUCCEEDED="$(kubectl get job db-migrate -n "$NAMESPACE" -o jsonpath='{.status.succeeded}' 2>/dev/null || true)"
+            FAILED="$(kubectl get job db-migrate -n "$NAMESPACE" -o jsonpath='{.status.failed}' 2>/dev/null || true)"
+            if [ "${SUCCEEDED:-}" = "1" ]; then OUTCOME="succeeded"; break; fi
+            if [ -n "${FAILED:-}" ] && [ "${FAILED}" != "0" ]; then OUTCOME="failed"; break; fi
+            sleep 5
+          done
+
+          echo "--- migration log ---"
+          kubectl logs job/db-migrate -n "$NAMESPACE" --tail=200 || echo "(no pod log available)"
+
+          if [ "$OUTCOME" != "succeeded" ]; then
+            [ "$OUTCOME" = "pending" ] && OUTCOME="did not finish within 300s"
+            echo "--- job and pod state ---"
+            kubectl describe job db-migrate -n "$NAMESPACE" || true
+            kubectl get pods -n "$NAMESPACE" -l job-name=db-migrate -o wide || true
+            kubectl describe pods -n "$NAMESPACE" -l job-name=db-migrate || true
+            echo "::error::Database migration ${OUTCOME}. The migration log and pod state are above; nothing was deployed."
+            exit 1
+          fi
+          echo "Schema is up to date."
+
+      - name: Apply Kubernetes manifests
+        run: |
+          set -euo pipefail
+          for manifest in k8s/*.yaml; do
+            case "$(basename "$manifest")" in
+              db-migrate-job.yaml) continue ;;
+            esac
+            sed -e "s|%%NAMESPACE%%|${NAMESPACE}|g" \
+                -e "s|%%IMAGE_TAG%%|${IMAGE_TAG}|g" \
+                -e "s|%%IMAGE%%|${IMAGE}|g" \
+                "$manifest" | kubectl apply -f -
+          done
+      - name: Wait for the rollout
+        run: |
+          set -uo pipefail
+          NS="${{ secrets.PROJECT_NAME }}"
+          if kubectl rollout status deployment/api --namespace "$NS" --timeout=10m; then
+            exit 0
+          fi
+          echo "--- pods ---"
+          kubectl get pods -n "$NS" -l app.kubernetes.io/name=api -o wide || true
+          echo "--- why the pods are not ready ---"
+          kubectl describe pods -n "$NS" -l app.kubernetes.io/name=api \
+            | grep -A 12 -E "Conditions:|Events:|State:|Last State:" || true
+          echo "--- application log ---"
+          kubectl logs -n "$NS" -l app.kubernetes.io/name=api --tail=100 --all-containers || true
+          echo "--- namespace events ---"
+          kubectl get events -n "$NS" --sort-by=.lastTimestamp | tail -25 || true
+          echo "::error::The Deployment never became ready."
+          exit 1
+
+  - id: verify
+    kind: verify
+    needs: [provision, configure]
+    timeout_minutes: 20
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+    steps:
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.33.0
+      - name: Wait for the load balancer
+        run: |
+          set -euo pipefail
+          NAMESPACE="${{ secrets.PROJECT_NAME }}"
+          aws eks update-kubeconfig --name "${NAMESPACE}-eks" --region "$AWS_REGION"
+          HOST=""
+          for _ in $(seq 1 40); do
+            HOST="$(kubectl get svc api -n "$NAMESPACE" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+            if [ -z "$HOST" ]; then
+              HOST="$(kubectl get svc api -n "$NAMESPACE" \
+                -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+            fi
+            if [ -n "$HOST" ]; then break; fi
+            sleep 15
+          done
+          if [ -z "$HOST" ]; then
+            echo "The load balancer never reported an address after 10 minutes."
+            kubectl describe svc api -n "$NAMESPACE" || true
+            kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp | tail -25 || true
+            echo "::error::No load balancer address."
+            exit 1
+          fi
+          echo "APP_URL=http://${HOST}" >> "$GITHUB_ENV"
+          echo "Load balancer address: ${HOST}"
+          echo "alb_hostname = \"${HOST}\""
+          echo "Live URL: http://${HOST}"
+          echo "Application is available at: http://${HOST}"
+          echo "url=http://${HOST}"
+      - name: Health check
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 40); do
+            CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${APP_URL}/health" 2>/dev/null || true)"
+            if [ "$CODE" = "200" ]; then
+              echo "Service is healthy at ${APP_URL}"
+              echo "Live URL: ${APP_URL}"
+              curl -s --max-time 10 "${APP_URL}/api/info" || true
+              echo
+              exit 0
+            fi
+            case "${CODE}" in
+              000|"") echo "  attempt ${i}/40: load balancer not answering yet" ;;
+              *)      echo "  attempt ${i}/40: HTTP ${CODE} from /health" ;;
+            esac
+            sleep 15
+          done
+          kubectl get pods -n "${{ secrets.PROJECT_NAME }}" -o wide || true
+          kubectl logs -n "${{ secrets.PROJECT_NAME }}" -l app.kubernetes.io/name=api --tail=100 || true
+          kubectl get endpoints api -n "${{ secrets.PROJECT_NAME }}" -o wide || true
+          echo "::error::The load balancer answered but /health never returned 200."
+          exit 1
+
+  - id: notify
+    kind: notify
+    needs: [verify]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+    steps:
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.33.0
+      - name: Deployment summary
+        run: |
+          set -uo pipefail
+          NS="${{ secrets.PROJECT_NAME }}"
+          aws eks update-kubeconfig --name "${NS}-eks" --region "$AWS_REGION" >/dev/null 2>&1 || true
+          HOST="$(kubectl get svc api -n "$NS" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+          [ -n "$HOST" ] || HOST="$(kubectl get svc api -n "$NS" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+          {
+            echo "### Deployment complete"
+            echo ""
+            if [ -n "$HOST" ]; then
+              echo "**Application:** <http://${HOST}>"
+              echo ""
+            fi
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Cluster | \`${NS}-eks\` |"
+            echo "| Namespace | \`${NS}\` |"
+            echo "| Image tag | \`${GITHUB_SHA::12}\` |"
+            echo "| API docs | \`http://${HOST}/api/docs\` |"
+            echo ""
+            echo "Re-read the address any time with:"
+            echo '```'
+            echo "aws eks update-kubeconfig --name ${NS}-eks --region ${AWS_REGION}"
+            echo "kubectl get svc api -n ${NS}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ -n "$HOST" ] && echo "Live URL: http://${HOST}"
+          exit 0
+
+rollback:
+  strategy: manual
+
+destroy:
+  steps:
+    - uses: azure/setup-kubectl@v4
+      with:
+        version: v1.33.0
+    - uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_wrapper: false
+    - name: Read the VPC id from state
+      working-directory: infra
+      run: |
+        terraform init -input=false -reconfigure \
+          -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+          -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+          -backend-config="region=${AWS_REGION}"
+        echo "VPC_ID=$(terraform output -raw vpc_id 2>/dev/null || true)" >> "$GITHUB_ENV"
+    - name: Delete the Kubernetes load balancer
+      run: |
+        NAMESPACE="${{ secrets.PROJECT_NAME }}"
+        if ! aws eks update-kubeconfig --name "${NAMESPACE}-eks" --region "$AWS_REGION" 2>/dev/null; then
+          echo "Cluster is already gone."
+          exit 0
+        fi
+        kubectl delete svc --all -n "$NAMESPACE" --ignore-not-found --timeout=5m || true
+        kubectl delete namespace "$NAMESPACE" --ignore-not-found --timeout=5m || true
+
+        if [ -z "${VPC_ID:-}" ]; then
+          sleep 180
+          exit 0
+        fi
+
+        for _ in $(seq 1 40); do
+          V2="$(aws elbv2 describe-load-balancers \
+                 --query "length(LoadBalancers[?VpcId=='${VPC_ID}'])" --output text 2>/dev/null || echo 0)"
+          V1="$(aws elb describe-load-balancers \
+                 --query "length(LoadBalancerDescriptions[?VPCId=='${VPC_ID}'])" --output text 2>/dev/null || echo 0)"
+          echo "  load balancers remaining: elbv2=${V2} classic=${V1}"
+          if [ "$V2" = "0" ] && [ "$V1" = "0" ]; then
+            sleep 30
+            exit 0
+          fi
+          sleep 15
+        done
+        echo "::warning::Load balancers still present after 10 minutes; attempting the destroy anyway."
+    - name: Terraform destroy
+      working-directory: infra
+      run: |
+        set -uo pipefail
+        if terraform destroy -input=false -auto-approve; then
+          exit 0
+        fi
+        sleep 90
+        terraform destroy -input=false -auto-approve

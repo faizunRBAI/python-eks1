@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Test and lint tooling. Never installed into the runtime image.
+pytest~=8.3
+httpx~=0.28
+ruff~=0.8
