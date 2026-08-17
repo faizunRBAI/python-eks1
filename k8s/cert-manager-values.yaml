@@ -1,0 +1,25 @@
+# cert-manager Helm values
+# installCRDs=true so the CRDs are owned by the Helm release and cleaned up on uninstall.
+
+installCRDs: true
+
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+
+webhook:
+  replicaCount: 1
+
+cainjector:
+  replicaCount: 1
+
+# Required: cert-manager must be able to watch Ingress objects cluster-wide
+# so it can respond to HTTP-01 challenges injected by the ingress-nginx solver.
+global:
+  leaderElection:
+    namespace: cert-manager

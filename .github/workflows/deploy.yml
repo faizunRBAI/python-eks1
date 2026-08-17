@@ -143,7 +143,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - name: Install Trivy
+    - name: Install checkov
       run: 'pip install --quiet "checkov>=3,<4"
 
         checkov --version
@@ -281,6 +281,13 @@ jobs:
     - uses: azure/setup-kubectl@v4
       with:
         version: v1.33.0
+    - name: Install Helm
+      run: 'curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        | bash
+
+        helm version
+
+        '
     - name: Read the database connection string
       run: "terraform init -input=false -reconfigure \\\n  -backend-config=\"bucket=${{\
         \ secrets.TF_STATE_BUCKET }}\" \\\n  -backend-config=\"key=${{ secrets.PROJECT_NAME\
@@ -293,6 +300,22 @@ jobs:
     - name: Configure cluster access
       run: "aws eks update-kubeconfig \\\n  --name \"${{ secrets.PROJECT_NAME }}-eks\"\
         \ \\\n  --region \"$AWS_REGION\"\n"
+    - name: Install cert-manager
+      run: "helm repo add jetstack https://charts.jetstack.io --force-update\nhelm\
+        \ repo update\nhelm upgrade --install cert-manager jetstack/cert-manager \\\
+        \n  --namespace cert-manager \\\n  --create-namespace \\\n  --version v1.16.2\
+        \ \\\n  --values k8s/cert-manager-values.yaml \\\n  --wait \\\n  --timeout\
+        \ 5m\n"
+    - name: Install ingress-nginx
+      run: "helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx\
+        \ --force-update\nhelm repo update\nhelm upgrade --install ingress-nginx ingress-nginx/ingress-nginx\
+        \ \\\n  --namespace ingress-nginx \\\n  --create-namespace \\\n  --version\
+        \ 4.11.3 \\\n  --values k8s/ingress-nginx-values.yaml \\\n  --wait \\\n  --timeout\
+        \ 5m\n"
+    - name: Apply ClusterIssuer (Let's Encrypt)
+      run: "# Wait until cert-manager webhook is ready before applying CRDs\nkubectl\
+        \ rollout status deployment/cert-manager-webhook \\\n  --namespace cert-manager\
+        \ --timeout=3m\nkubectl apply -f k8s/clusterissuer.yaml\n"
     - name: Install the metrics server
       run: "kubectl apply -f \\\n  https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml\n"
     - name: Bootstrap namespace, secret and service account
@@ -330,10 +353,11 @@ jobs:
         \ was deployed.\"\n  exit 1\nfi\necho \"Schema is up to date.\"\n"
     - name: Apply Kubernetes manifests
       run: "set -euo pipefail\nfor manifest in k8s/*.yaml; do\n  case \"$(basename\
-        \ \"$manifest\")\" in\n    db-migrate-job.yaml) continue ;;\n  esac\n  sed\
-        \ -e \"s|%%NAMESPACE%%|${NAMESPACE}|g\" \\\n      -e \"s|%%IMAGE_TAG%%|${IMAGE_TAG}|g\"\
-        \ \\\n      -e \"s|%%IMAGE%%|${IMAGE}|g\" \\\n      \"$manifest\" | kubectl\
-        \ apply -f -\ndone\n"
+        \ \"$manifest\")\" in\n    db-migrate-job.yaml) continue ;;\n    ingress-nginx-values.yaml)\
+        \ continue ;;\n    cert-manager-values.yaml) continue ;;\n    clusterissuer.yaml)\
+        \ continue ;;\n  esac\n  sed -e \"s|%%NAMESPACE%%|${NAMESPACE}|g\" \\\n  \
+        \    -e \"s|%%IMAGE_TAG%%|${IMAGE_TAG}|g\" \\\n      -e \"s|%%IMAGE%%|${IMAGE}|g\"\
+        \ \\\n      \"$manifest\" | kubectl apply -f -\ndone\n"
     - name: Wait for the rollout
       run: "set -uo pipefail\nNS=\"${{ secrets.PROJECT_NAME }}\"\nif kubectl rollout\
         \ status deployment/api --namespace \"$NS\" --timeout=10m; then\n  exit 0\n\
@@ -360,35 +384,30 @@ jobs:
     - uses: azure/setup-kubectl@v4
       with:
         version: v1.33.0
-    - name: Wait for the load balancer
+    - name: Get ingress-nginx NLB hostname
       run: "set -euo pipefail\nNAMESPACE=\"${{ secrets.PROJECT_NAME }}\"\naws eks\
         \ update-kubeconfig --name \"${NAMESPACE}-eks\" --region \"$AWS_REGION\"\n\
-        HOST=\"\"\nfor _ in $(seq 1 40); do\n  HOST=\"$(kubectl get svc api -n \"\
-        $NAMESPACE\" \\\n    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'\
+        HOST=\"\"\nfor _ in $(seq 1 40); do\n  HOST=\"$(kubectl get svc ingress-nginx-controller\
+        \ -n ingress-nginx \\\n    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'\
         \ 2>/dev/null || true)\"\n  if [ -z \"$HOST\" ]; then\n    HOST=\"$(kubectl\
-        \ get svc api -n \"$NAMESPACE\" \\\n      -o jsonpath='{.status.loadBalancer.ingress[0].ip}'\
+        \ get svc ingress-nginx-controller -n ingress-nginx \\\n      -o jsonpath='{.status.loadBalancer.ingress[0].ip}'\
         \ 2>/dev/null || true)\"\n  fi\n  if [ -n \"$HOST\" ]; then break; fi\n  sleep\
-        \ 15\ndone\nif [ -z \"$HOST\" ]; then\n  echo \"The load balancer never reported\
-        \ an address after 10 minutes.\"\n  kubectl describe svc api -n \"$NAMESPACE\"\
-        \ || true\n  kubectl get events -n \"$NAMESPACE\" --sort-by=.lastTimestamp\
-        \ | tail -25 || true\n  echo \"::error::No load balancer address.\"\n  exit\
-        \ 1\nfi\necho \"APP_URL=http://${HOST}\" >> \"$GITHUB_ENV\"\necho \"Load balancer\
-        \ address: ${HOST}\"\necho \"alb_hostname = \\\"${HOST}\\\"\"\necho \"Live\
-        \ URL: http://${HOST}\"\necho \"Application is available at: http://${HOST}\"\
-        \necho \"url=http://${HOST}\"\n"
-    - name: Health check
+        \ 15\ndone\nif [ -z \"$HOST\" ]; then\n  echo \"The ingress-nginx NLB never\
+        \ reported an address after 10 minutes.\"\n  kubectl describe svc ingress-nginx-controller\
+        \ -n ingress-nginx || true\n  echo \"::error::No ingress-nginx NLB address.\"\
+        \n  exit 1\nfi\necho \"INGRESS_HOST=${HOST}\" >> \"$GITHUB_ENV\"\necho \"\
+        Ingress NLB: ${HOST}\"\necho \"\"\necho \"============================================================\"\
+        \necho \"ACTION REQUIRED \u2014 add this CNAME in cPanel:\"\necho \"  Name:\
+        \  faizun\"\necho \"  Type:  CNAME\"\necho \"  Value: ${HOST}\"\necho \"============================================================\"\
+        \n"
+    - name: Health check via NLB (pre-DNS)
       run: "set -euo pipefail\nfor i in $(seq 1 40); do\n  CODE=\"$(curl -s -o /dev/null\
-        \ -w '%{http_code}' --max-time 10 \"${APP_URL}/health\" 2>/dev/null || true)\"\
-        \n  if [ \"$CODE\" = \"200\" ]; then\n    echo \"Service is healthy at ${APP_URL}\"\
-        \n    echo \"Live URL: ${APP_URL}\"\n    curl -s --max-time 10 \"${APP_URL}/api/info\"\
-        \ || true\n    echo\n    exit 0\n  fi\n  case \"${CODE}\" in\n    000|\"\"\
-        ) echo \"  attempt ${i}/40: load balancer not answering yet\" ;;\n    *) \
-        \     echo \"  attempt ${i}/40: HTTP ${CODE} from /health\" ;;\n  esac\n \
-        \ sleep 15\ndone\nkubectl get pods -n \"${{ secrets.PROJECT_NAME }}\" -o wide\
-        \ || true\nkubectl logs -n \"${{ secrets.PROJECT_NAME }}\" -l app.kubernetes.io/name=api\
-        \ --tail=100 || true\nkubectl get endpoints api -n \"${{ secrets.PROJECT_NAME\
-        \ }}\" -o wide || true\necho \"::error::The load balancer answered but /health\
-        \ never returned 200.\"\nexit 1\n"
+        \ -w '%{http_code}' \\\n    --max-time 10 \\\n    --header \"Host: faizun.hepttech.com\"\
+        \ \\\n    \"http://${INGRESS_HOST}/health\" 2>/dev/null || true)\"\n  if [\
+        \ \"$CODE\" = \"200\" ]; then\n    echo \"Service is healthy via ingress (HTTP\
+        \ ${CODE})\"\n    exit 0\n  fi\n  echo \"  attempt ${i}/40: HTTP ${CODE}\"\
+        \n  sleep 15\ndone\necho \"::error::App never returned 200 through ingress-nginx.\"\
+        \nexit 1\n"
   notify:
     runs-on: ubuntu-latest
     needs:
@@ -405,15 +424,18 @@ jobs:
     - name: Deployment summary
       run: "set -uo pipefail\nNS=\"${{ secrets.PROJECT_NAME }}\"\naws eks update-kubeconfig\
         \ --name \"${NS}-eks\" --region \"$AWS_REGION\" >/dev/null 2>&1 || true\n\
-        HOST=\"$(kubectl get svc api -n \"$NS\" \\\n  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'\
-        \ 2>/dev/null || true)\"\n[ -n \"$HOST\" ] || HOST=\"$(kubectl get svc api\
-        \ -n \"$NS\" \\\n  -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null\
-        \ || true)\"\n{\n  echo \"### Deployment complete\"\n  echo \"\"\n  if [ -n\
-        \ \"$HOST\" ]; then\n    echo \"**Application:** <http://${HOST}>\"\n    echo\
-        \ \"\"\n  fi\n  echo \"| | |\"\n  echo \"|---|---|\"\n  echo \"| Cluster |\
+        HOST=\"$(kubectl get svc ingress-nginx-controller -n ingress-nginx \\\n  -o\
+        \ jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)\"\
+        \n[ -n \"$HOST\" ] || HOST=\"$(kubectl get svc ingress-nginx-controller -n\
+        \ ingress-nginx \\\n  -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null\
+        \ || true)\"\n{\n  echo \"### Deployment complete\"\n  echo \"\"\n  echo \"\
+        **Custom domain:** https://faizun.hepttech.com (after CNAME propagates)\"\n\
+        \  echo \"\"\n  echo \"**Required cPanel DNS action:**\"\n  echo \"| Field\
+        \ | Value |\"\n  echo \"|---|---|\"\n  echo \"| Name | \\`faizun\\` |\"\n\
+        \  echo \"| Type | \\`CNAME\\` |\"\n  echo \"| Value | \\`${HOST}\\` |\"\n\
+        \  echo \"\"\n  echo \"| | |\"\n  echo \"|---|---|\"\n  echo \"| Cluster |\
         \ \\`${NS}-eks\\` |\"\n  echo \"| Namespace | \\`${NS}\\` |\"\n  echo \"|\
-        \ Image tag | \\`${GITHUB_SHA::12}\\` |\"\n  echo \"| API docs | \\`http://${HOST}/api/docs\\\
-        ` |\"\n  echo \"\"\n  echo \"Re-read the address any time with:\"\n  echo\
-        \ '```'\n  echo \"aws eks update-kubeconfig --name ${NS}-eks --region ${AWS_REGION}\"\
-        \n  echo \"kubectl get svc api -n ${NS}\"\n  echo '```'\n} >> \"$GITHUB_STEP_SUMMARY\"\
-        \n[ -n \"$HOST\" ] && echo \"Live URL: http://${HOST}\"\nexit 0\n"
+        \ Image tag | \\`${GITHUB_SHA::12}\\` |\"\n  echo \"| Ingress NLB | \\`${HOST}\\\
+        ` |\"\n  echo \"| API docs | \\`https://faizun.hepttech.com/docs\\` |\"\n\
+        \  echo \"\"\n} >> \"$GITHUB_STEP_SUMMARY\"\n[ -n \"$HOST\" ] && echo \"Ingress\
+        \ NLB: ${HOST}\"\nexit 0\n"

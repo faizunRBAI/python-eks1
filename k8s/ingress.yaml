@@ -1,0 +1,30 @@
+# Ingress for faizun.hepttech.com
+# cert-manager will automatically provision and renew the TLS certificate via
+# the letsencrypt-prod ClusterIssuer using the HTTP-01 challenge.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api
+  namespace: %%NAMESPACE%%
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    # Ensure nginx proxies to the app's ClusterIP service on port 80.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - faizun.hepttech.com
+      secretName: faizun-hepttech-tls
+  rules:
+    - host: faizun.hepttech.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80

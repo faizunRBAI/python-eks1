@@ -5,17 +5,11 @@ metadata:
   namespace: '%%NAMESPACE%%'
   labels:
     app.kubernetes.io/name: api
-  annotations:
-    # A network load balancer, provisioned by the AWS cloud controller that EKS
-    # runs in the control plane — no extra ingress controller to install or
-    # keep upgraded. Move to an Ingress plus the AWS Load Balancer Controller
-    # when you need TLS termination, host routing or WAF.
-    service.beta.kubernetes.io/aws-load-balancer-type: 'nlb'
-    service.beta.kubernetes.io/aws-load-balancer-scheme: 'internet-facing'
-    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: 'true'
+  # Traffic now enters via ingress-nginx (NLB → ingress controller → ClusterIP).
+  # The LoadBalancer type and its annotations have been removed — the ingress
+  # controller owns the NLB.
 spec:
-  type: LoadBalancer
-  externalTrafficPolicy: Cluster
+  type: ClusterIP
   selector:
     app.kubernetes.io/name: api
   ports:

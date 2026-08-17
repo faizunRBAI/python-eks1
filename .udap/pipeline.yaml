@@ -104,8 +104,6 @@ stages:
     needs: []
     steps:
       - name: Install Gitleaks
-        # Downloaded via Python's built-in urllib — no curl, wget, or sudo needed.
-        # Python 3 is always available on GitHub-hosted runners and in the UDAP sandbox.
         run: |
           mkdir -p bin
           python3 - <<'PYEOF'
@@ -212,23 +210,11 @@ stages:
     kind: security
     needs: []
     steps:
-      - name: Install Trivy
-        # pip install trivy-python-client is not the scanner; use the PyPI
-        # package 'trivy' which wraps the binary download reliably.
-        # Alternatively, install via pip install trivy (the wrapper pip package
-        # that ships the binary for linux/amd64). Fallback: use checkov only,
-        # which installs cleanly via pip and covers the same Terraform rules.
-        # Decision: install checkov (pure Python, pip-installable, no binary
-        # download needed) as the primary IaC scanner. Checkov covers all the
-        # same CIS/NIST Terraform rules as Trivy config. Trivy image scanning
-        # runs on GH runners where apt-get and wget are available.
+      - name: Install checkov
         run: |
           pip install --quiet "checkov>=3,<4"
           checkov --version
       - name: Terraform security scan
-        # Fail on HIGH and CRITICAL (checkov equivalent of Trivy CRITICAL gate).
-        # Accepted findings are suppressed via inline checkov:skip comments or
-        # a .checkov.yaml baseline file.
         run: |
           checkov --directory infra --framework terraform --compact \
             --check CKV_AWS_111,CKV_AWS_18,CKV_AWS_19,CKV_AWS_20,CKV_AWS_23,CKV_AWS_25,CKV_AWS_26,CKV_AWS_28,CKV_AWS_32,CKV_AWS_33,CKV_AWS_34,CKV_AWS_36,CKV_AWS_37,CKV_AWS_38,CKV_AWS_39,CKV_AWS_40,CKV_AWS_41,CKV_AWS_42,CKV_AWS_43,CKV_AWS_44,CKV_AWS_45,CKV_AWS_50,CKV_AWS_51,CKV_AWS_52,CKV_AWS_53,CKV_AWS_54,CKV_AWS_55,CKV_AWS_56,CKV_AWS_57,CKV_AWS_58,CKV_AWS_59,CKV_AWS_60,CKV_AWS_61,CKV_AWS_62,CKV_AWS_63,CKV_AWS_64,CKV_AWS_65,CKV_AWS_66,CKV_AWS_67,CKV_AWS_68,CKV_AWS_69 \
@@ -302,8 +288,6 @@ stages:
       AWS_REGION: us-east-1
     steps:
       - name: Install Trivy
-        # On GitHub-hosted ubuntu-latest runners, apt-get, wget, gpg and sudo
-        # are all available. The apt repository is the authoritative install path.
         run: |
           sudo apt-get install -y --no-install-recommends wget gnupg apt-transport-https
           wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
@@ -359,6 +343,12 @@ stages:
       - uses: azure/setup-kubectl@v4
         with:
           version: v1.33.0
+
+      - name: Install Helm
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm version
+
       - name: Read the database connection string
         working-directory: infra
         run: |
@@ -373,15 +363,49 @@ stages:
             echo "No database in this configuration — the service will run stateless."
           fi
           echo "DB_URL=${DB_URL}" >> "$GITHUB_ENV"
+
       - name: Configure cluster access
         run: |
           aws eks update-kubeconfig \
             --name "${{ secrets.PROJECT_NAME }}-eks" \
             --region "$AWS_REGION"
+
+      - name: Install cert-manager
+        run: |
+          helm repo add jetstack https://charts.jetstack.io --force-update
+          helm repo update
+          helm upgrade --install cert-manager jetstack/cert-manager \
+            --namespace cert-manager \
+            --create-namespace \
+            --version v1.16.2 \
+            --values k8s/cert-manager-values.yaml \
+            --wait \
+            --timeout 5m
+
+      - name: Install ingress-nginx
+        run: |
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx --force-update
+          helm repo update
+          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+            --namespace ingress-nginx \
+            --create-namespace \
+            --version 4.11.3 \
+            --values k8s/ingress-nginx-values.yaml \
+            --wait \
+            --timeout 5m
+
+      - name: Apply ClusterIssuer (Let's Encrypt)
+        run: |
+          # Wait until cert-manager webhook is ready before applying CRDs
+          kubectl rollout status deployment/cert-manager-webhook \
+            --namespace cert-manager --timeout=3m
+          kubectl apply -f k8s/clusterissuer.yaml
+
       - name: Install the metrics server
         run: |
           kubectl apply -f \
             https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
+
       - name: Bootstrap namespace, secret and service account
         run: |
           set -euo pipefail
@@ -448,12 +472,16 @@ stages:
           for manifest in k8s/*.yaml; do
             case "$(basename "$manifest")" in
               db-migrate-job.yaml) continue ;;
+              ingress-nginx-values.yaml) continue ;;
+              cert-manager-values.yaml) continue ;;
+              clusterissuer.yaml) continue ;;
             esac
             sed -e "s|%%NAMESPACE%%|${NAMESPACE}|g" \
                 -e "s|%%IMAGE_TAG%%|${IMAGE_TAG}|g" \
                 -e "s|%%IMAGE%%|${IMAGE}|g" \
                 "$manifest" | kubectl apply -f -
           done
+
       - name: Wait for the rollout
         run: |
           set -uo pipefail
@@ -485,57 +513,56 @@ stages:
       - uses: azure/setup-kubectl@v4
         with:
           version: v1.33.0
-      - name: Wait for the load balancer
+      - name: Get ingress-nginx NLB hostname
         run: |
           set -euo pipefail
           NAMESPACE="${{ secrets.PROJECT_NAME }}"
           aws eks update-kubeconfig --name "${NAMESPACE}-eks" --region "$AWS_REGION"
           HOST=""
           for _ in $(seq 1 40); do
-            HOST="$(kubectl get svc api -n "$NAMESPACE" \
+            HOST="$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
               -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
             if [ -z "$HOST" ]; then
-              HOST="$(kubectl get svc api -n "$NAMESPACE" \
+              HOST="$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
                 -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
             fi
             if [ -n "$HOST" ]; then break; fi
             sleep 15
           done
           if [ -z "$HOST" ]; then
-            echo "The load balancer never reported an address after 10 minutes."
-            kubectl describe svc api -n "$NAMESPACE" || true
-            kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp | tail -25 || true
-            echo "::error::No load balancer address."
+            echo "The ingress-nginx NLB never reported an address after 10 minutes."
+            kubectl describe svc ingress-nginx-controller -n ingress-nginx || true
+            echo "::error::No ingress-nginx NLB address."
             exit 1
           fi
-          echo "APP_URL=http://${HOST}" >> "$GITHUB_ENV"
-          echo "Load balancer address: ${HOST}"
-          echo "alb_hostname = \"${HOST}\""
-          echo "Live URL: http://${HOST}"
-          echo "Application is available at: http://${HOST}"
-          echo "url=http://${HOST}"
-      - name: Health check
+          echo "INGRESS_HOST=${HOST}" >> "$GITHUB_ENV"
+          echo "Ingress NLB: ${HOST}"
+          echo ""
+          echo "============================================================"
+          echo "ACTION REQUIRED — add this CNAME in cPanel:"
+          echo "  Name:  faizun"
+          echo "  Type:  CNAME"
+          echo "  Value: ${HOST}"
+          echo "============================================================"
+
+      - name: Health check via NLB (pre-DNS)
+        # Verifies the app responds correctly through the ingress controller
+        # even before the CNAME propagates, by sending the Host header manually.
         run: |
           set -euo pipefail
           for i in $(seq 1 40); do
-            CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${APP_URL}/health" 2>/dev/null || true)"
+            CODE="$(curl -s -o /dev/null -w '%{http_code}' \
+              --max-time 10 \
+              --header "Host: faizun.hepttech.com" \
+              "http://${INGRESS_HOST}/health" 2>/dev/null || true)"
             if [ "$CODE" = "200" ]; then
-              echo "Service is healthy at ${APP_URL}"
-              echo "Live URL: ${APP_URL}"
-              curl -s --max-time 10 "${APP_URL}/api/info" || true
-              echo
+              echo "Service is healthy via ingress (HTTP ${CODE})"
               exit 0
             fi
-            case "${CODE}" in
-              000|"") echo "  attempt ${i}/40: load balancer not answering yet" ;;
-              *)      echo "  attempt ${i}/40: HTTP ${CODE} from /health" ;;
-            esac
+            echo "  attempt ${i}/40: HTTP ${CODE}"
             sleep 15
           done
-          kubectl get pods -n "${{ secrets.PROJECT_NAME }}" -o wide || true
-          kubectl logs -n "${{ secrets.PROJECT_NAME }}" -l app.kubernetes.io/name=api --tail=100 || true
-          kubectl get endpoints api -n "${{ secrets.PROJECT_NAME }}" -o wide || true
-          echo "::error::The load balancer answered but /health never returned 200."
+          echo "::error::App never returned 200 through ingress-nginx."
           exit 1
 
   - id: notify
@@ -554,31 +581,32 @@ stages:
           set -uo pipefail
           NS="${{ secrets.PROJECT_NAME }}"
           aws eks update-kubeconfig --name "${NS}-eks" --region "$AWS_REGION" >/dev/null 2>&1 || true
-          HOST="$(kubectl get svc api -n "$NS" \
+          HOST="$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
             -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
-          [ -n "$HOST" ] || HOST="$(kubectl get svc api -n "$NS" \
+          [ -n "$HOST" ] || HOST="$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
             -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
           {
             echo "### Deployment complete"
             echo ""
-            if [ -n "$HOST" ]; then
-              echo "**Application:** <http://${HOST}>"
-              echo ""
-            fi
+            echo "**Custom domain:** https://faizun.hepttech.com (after CNAME propagates)"
+            echo ""
+            echo "**Required cPanel DNS action:**"
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Name | \`faizun\` |"
+            echo "| Type | \`CNAME\` |"
+            echo "| Value | \`${HOST}\` |"
+            echo ""
             echo "| | |"
             echo "|---|---|"
             echo "| Cluster | \`${NS}-eks\` |"
             echo "| Namespace | \`${NS}\` |"
             echo "| Image tag | \`${GITHUB_SHA::12}\` |"
-            echo "| API docs | \`http://${HOST}/api/docs\` |"
+            echo "| Ingress NLB | \`${HOST}\` |"
+            echo "| API docs | \`https://faizun.hepttech.com/docs\` |"
             echo ""
-            echo "Re-read the address any time with:"
-            echo '```'
-            echo "aws eks update-kubeconfig --name ${NS}-eks --region ${AWS_REGION}"
-            echo "kubectl get svc api -n ${NS}"
-            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          [ -n "$HOST" ] && echo "Live URL: http://${HOST}"
+          [ -n "$HOST" ] && echo "Ingress NLB: ${HOST}"
           exit 0
 
 rollback:
@@ -592,6 +620,10 @@ destroy:
     - uses: hashicorp/setup-terraform@v3
       with:
         terraform_wrapper: false
+    - name: Install Helm
+      run: |
+        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+        helm version
     - name: Read the VPC id from state
       working-directory: infra
       run: |
@@ -600,21 +632,33 @@ destroy:
           -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
           -backend-config="region=${AWS_REGION}"
         echo "VPC_ID=$(terraform output -raw vpc_id 2>/dev/null || true)" >> "$GITHUB_ENV"
-    - name: Delete the Kubernetes load balancer
+    - name: Configure cluster access
       run: |
         NAMESPACE="${{ secrets.PROJECT_NAME }}"
         if ! aws eks update-kubeconfig --name "${NAMESPACE}-eks" --region "$AWS_REGION" 2>/dev/null; then
-          echo "Cluster is already gone."
+          echo "Cluster is already gone — skipping Kubernetes cleanup."
           exit 0
         fi
-        kubectl delete svc --all -n "$NAMESPACE" --ignore-not-found --timeout=5m || true
+        echo "CLUSTER_ACCESSIBLE=true" >> "$GITHUB_ENV"
+    - name: Uninstall ingress-nginx (removes its NLB)
+      run: |
+        if [ "${CLUSTER_ACCESSIBLE:-}" != "true" ]; then exit 0; fi
+        helm uninstall ingress-nginx --namespace ingress-nginx --ignore-not-found --wait --timeout 5m || true
+    - name: Uninstall cert-manager
+      run: |
+        if [ "${CLUSTER_ACCESSIBLE:-}" != "true" ]; then exit 0; fi
+        helm uninstall cert-manager --namespace cert-manager --ignore-not-found --wait --timeout 5m || true
+    - name: Delete the app namespace and its resources
+      run: |
+        if [ "${CLUSTER_ACCESSIBLE:-}" != "true" ]; then exit 0; fi
+        NAMESPACE="${{ secrets.PROJECT_NAME }}"
         kubectl delete namespace "$NAMESPACE" --ignore-not-found --timeout=5m || true
-
+    - name: Wait for LBs to be released
+      run: |
         if [ -z "${VPC_ID:-}" ]; then
-          sleep 180
+          sleep 60
           exit 0
         fi
-
         for _ in $(seq 1 40); do
           V2="$(aws elbv2 describe-load-balancers \
                  --query "length(LoadBalancers[?VpcId=='${VPC_ID}'])" --output text 2>/dev/null || echo 0)"

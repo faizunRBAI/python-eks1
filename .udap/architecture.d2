@@ -1,7 +1,8 @@
 # udap:meta cloud=aws region=us-east-1 target=eks
 
 users: API Clients { udap-type: generic.user }
-nlb: Network Load Balancer { udap-type: aws.alb }
+ingress: ingress-nginx (NLB) { udap-type: aws.alb }
+certmgr: cert-manager (Let's Encrypt) { udap-type: generic.app }
 registry: Image Registry (ECR) { udap-type: aws.ecr }
 audit: Audit + Flow Logs { udap-type: aws.cloudwatch }
 vpc: VPC across 2 Availability Zones {
@@ -9,8 +10,9 @@ vpc: VPC across 2 Availability Zones {
   db: Postgres (RDS) { shape: cylinder; udap-type: aws.rds }
 }
 
-users -> nlb: HTTPS
-nlb -> vpc.api: port 80
+users -> ingress: HTTPS 443
+ingress -> vpc.api: port 80 (ClusterIP)
+certmgr -> ingress: TLS cert
 vpc.api -> vpc.db: SQL 5432
 registry -> vpc.api: image pull
 vpc.api -> audit: logs

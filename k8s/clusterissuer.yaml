@@ -1,0 +1,18 @@
+# Let's Encrypt production ClusterIssuer — HTTP-01 challenge via ingress-nginx.
+# cert-manager will create a temporary Ingress to answer the ACME challenge on port 80.
+# IMPORTANT: port 80 on the NLB must be reachable from the internet BEFORE issuance.
+# Do NOT redirect 80→443 globally until the first certificate has been issued.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@hepttech.com
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx

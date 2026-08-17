@@ -19,6 +19,13 @@ jobs:
     - uses: hashicorp/setup-terraform@v3
       with:
         terraform_wrapper: false
+    - name: Install Helm
+      run: 'curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        | bash
+
+        helm version
+
+        '
     - name: Read the VPC id from state
       run: "terraform init -input=false -reconfigure \\\n  -backend-config=\"bucket=${{\
         \ secrets.TF_STATE_BUCKET }}\" \\\n  -backend-config=\"key=${{ secrets.PROJECT_NAME\
@@ -26,13 +33,35 @@ jobs:
         echo \"VPC_ID=$(terraform output -raw vpc_id 2>/dev/null || true)\" >> \"\
         $GITHUB_ENV\"\n"
       working-directory: infra
-    - name: Delete the Kubernetes load balancer
+    - name: Configure cluster access
       run: "NAMESPACE=\"${{ secrets.PROJECT_NAME }}\"\nif ! aws eks update-kubeconfig\
         \ --name \"${NAMESPACE}-eks\" --region \"$AWS_REGION\" 2>/dev/null; then\n\
-        \  echo \"Cluster is already gone.\"\n  exit 0\nfi\nkubectl delete svc --all\
-        \ -n \"$NAMESPACE\" --ignore-not-found --timeout=5m || true\nkubectl delete\
-        \ namespace \"$NAMESPACE\" --ignore-not-found --timeout=5m || true\n\nif [\
-        \ -z \"${VPC_ID:-}\" ]; then\n  sleep 180\n  exit 0\nfi\n\nfor _ in $(seq\
+        \  echo \"Cluster is already gone \u2014 skipping Kubernetes cleanup.\"\n\
+        \  exit 0\nfi\necho \"CLUSTER_ACCESSIBLE=true\" >> \"$GITHUB_ENV\"\n"
+    - name: Uninstall ingress-nginx (removes its NLB)
+      run: 'if [ "${CLUSTER_ACCESSIBLE:-}" != "true" ]; then exit 0; fi
+
+        helm uninstall ingress-nginx --namespace ingress-nginx --ignore-not-found
+        --wait --timeout 5m || true
+
+        '
+    - name: Uninstall cert-manager
+      run: 'if [ "${CLUSTER_ACCESSIBLE:-}" != "true" ]; then exit 0; fi
+
+        helm uninstall cert-manager --namespace cert-manager --ignore-not-found --wait
+        --timeout 5m || true
+
+        '
+    - name: Delete the app namespace and its resources
+      run: 'if [ "${CLUSTER_ACCESSIBLE:-}" != "true" ]; then exit 0; fi
+
+        NAMESPACE="${{ secrets.PROJECT_NAME }}"
+
+        kubectl delete namespace "$NAMESPACE" --ignore-not-found --timeout=5m || true
+
+        '
+    - name: Wait for LBs to be released
+      run: "if [ -z \"${VPC_ID:-}\" ]; then\n  sleep 60\n  exit 0\nfi\nfor _ in $(seq\
         \ 1 40); do\n  V2=\"$(aws elbv2 describe-load-balancers \\\n         --query\
         \ \"length(LoadBalancers[?VpcId=='${VPC_ID}'])\" --output text 2>/dev/null\
         \ || echo 0)\"\n  V1=\"$(aws elb describe-load-balancers \\\n         --query\
